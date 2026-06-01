@@ -1,42 +1,31 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import * as faceapi from 'face-api.js';
 
 const MODEL_URL = '/models';
 
-const BLINK_THRESHOLD = 0.22;
-const EYE_OPEN_THRESHOLD = 0.28;
-const LIVENESS_FRAMES = 60;
-
-function getEAR(landmarks) {
-  const leftEye = landmarks.positions.slice(36, 42);
-  const rightEye = landmarks.positions.slice(42, 48);
-
-  const earLeft = (
-    dist(leftEye[1], leftEye[5]) + dist(leftEye[2], leftEye[4])
-  ) / (2 * dist(leftEye[0], leftEye[3]));
-
-  const earRight = (
-    dist(rightEye[1], rightEye[5]) + dist(rightEye[2], rightEye[4])
-  ) / (2 * dist(rightEye[0], rightEye[3]));
-
-  return (earLeft + earRight) / 2;
-}
-
-function dist(a, b) {
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
-}
+const POSITION_BUFFER_SIZE = 5;
+const MOTION_THRESHOLD = 6;
+const LIVENESS_FRAMES_NEEDED = 3;
+const TIMEOUT_FRAMES = 100;
 
 export default function FaceVerification({ selectedGender, onVerified }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
-  const earHistoryRef = useRef([]);
-  const blinkCountRef = useRef(0);
-  const eyeClosedRef = useRef(false);
+  const phaseRef = useRef('loading');
+  const intervalRef = useRef(null);
   const frameCountRef = useRef(0);
+  const positionHistoryRef = useRef([]);
+  const motionCountRef = useRef(0);
+
   const [status, setStatus] = useState('loading');
   const [statusText, setStatusText] = useState('Loading face detection models...');
   const [errorDetail, setErrorDetail] = useState('');
+
+  function setPhase(newPhase) {
+    phaseRef.current = newPhase;
+    setStatus(newPhase);
+  }
 
   async function loadModels() {
     try {
@@ -53,7 +42,71 @@ export default function FaceVerification({ selectedGender, onVerified }) {
     }
   }
 
-  const runDetection = useCallback(async () => {
+  useEffect(() => {
+    let mounted = true;
+
+    async function setup() {
+      setStatusText('Loading face detection models...');
+
+      const modelsLoaded = await loadModels();
+      if (!mounted) return;
+
+      if (!modelsLoaded) {
+        setPhase('error');
+        setStatusText('Failed to load face detection models. Check your internet connection.');
+        return;
+      }
+
+      setStatusText('Starting camera...');
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: 640, height: 480 },
+          audio: false,
+        });
+      } catch (err) {
+        if (!mounted) return;
+        setPhase('error');
+        if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+          setStatusText('Camera not found. Please connect a webcam and refresh.');
+        } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setStatusText('Camera access denied. Please allow camera access in your browser settings and refresh.');
+        } else {
+          setStatusText(`Camera error: ${err.message}. Please refresh and try again.`);
+        }
+        return;
+      }
+
+      if (!mounted) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      streamRef.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      setPhase('liveness');
+      setStatusText('Move your head slightly to prove you are a real person...');
+
+      intervalRef.current = setInterval(runDetection, 300);
+    }
+
+    setup();
+
+    return () => {
+      mounted = false;
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, []);
+
+  async function runDetection() {
     if (!videoRef.current || !canvasRef.current) return;
 
     const video = videoRef.current;
@@ -66,7 +119,7 @@ export default function FaceVerification({ selectedGender, onVerified }) {
     let detections;
     try {
       detections = await faceapi
-        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320 }))
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416 }))
         .withFaceLandmarks()
         .withAgeAndGender();
     } catch {
@@ -91,57 +144,78 @@ export default function FaceVerification({ selectedGender, onVerified }) {
     faceapi.draw.drawDetections(canvas, resized);
     faceapi.draw.drawFaceLandmarks(canvas, resized);
 
-    const ear = getEAR(result.landmarks);
+    const currentPhase = phaseRef.current;
 
-    if (status === 'liveness') {
+    if (currentPhase === 'liveness') {
       frameCountRef.current++;
 
-      earHistoryRef.current.push(ear);
-      if (earHistoryRef.current > LIVENESS_FRAMES) {
-        earHistoryRef.current.shift();
+      const cx = result.detection.box.x + result.detection.box.width / 2;
+      const cy = result.detection.box.y + result.detection.box.height / 2;
+
+      const hist = positionHistoryRef.current;
+      hist.push({ x: cx, y: cy });
+      if (hist.length > POSITION_BUFFER_SIZE) {
+        hist.shift();
       }
 
-      if (ear < BLINK_THRESHOLD && !eyeClosedRef.current) {
-        eyeClosedRef.current = true;
-      }
-
-      if (ear > EYE_OPEN_THRESHOLD && eyeClosedRef.current) {
-        blinkCountRef.current++;
-        eyeClosedRef.current = false;
-        setStatusText(`✓ Blink detected! (${blinkCountRef.current}/2)`);
-      }
+      const motion = hist.length >= POSITION_BUFFER_SIZE
+        ? hist.reduce((maxDist, p) => {
+            const d = Math.sqrt((p.x - cx) ** 2 + (p.y - cy) ** 2);
+            return Math.max(maxDist, d);
+          }, 0)
+        : 0;
 
       ctx.fillStyle = '#ffffff';
-      ctx.font = '16px system-ui, sans-serif';
-      ctx.fillText(`EAR: ${ear.toFixed(3)}`, 10, 70);
+      ctx.font = '14px system-ui, sans-serif';
+      ctx.fillText(`Motion: ${motion.toFixed(1)}px`, 10, 70);
 
-      if (blinkCountRef.current >= 2) {
-        setStatus('verifying');
+      if (motion > MOTION_THRESHOLD) {
+        motionCountRef.current++;
+        positionHistoryRef.current = [];
+        setStatusText(
+          `✓ Movement ${motionCountRef.current}/${LIVENESS_FRAMES_NEEDED} detected!`
+        );
+      } else if (motionCountRef.current < LIVENESS_FRAMES_NEEDED && frameCountRef.current % 10 === 0) {
+        setStatusText(
+          `Move your head slightly... (motion: ${motion.toFixed(1)}px, need > ${MOTION_THRESHOLD}px)`
+        );
+      }
+
+      if (motionCountRef.current >= LIVENESS_FRAMES_NEEDED) {
+        setPhase('verifying');
         setStatusText('Checking gender...');
-        blinkCountRef.current = 0;
-        earHistoryRef.current = [];
+        motionCountRef.current = 0;
         return;
       }
 
-      if (frameCountRef.current > 300) {
-        setStatus('error');
-        setStatusText('Liveness check timed out. Please look at the camera and blink naturally.');
+      if (frameCountRef.current > TIMEOUT_FRAMES) {
+        setPhase('error');
+        setStatusText('Liveness check timed out. Please move your head slightly and try again.');
         return;
       }
     }
 
-    if (status === 'verifying' || status === 'liveness-done') {
+    if (currentPhase === 'verifying') {
+      if (!result.gender) {
+        setStatusText('Gender detection unavailable. Check console for details.');
+        console.error('Gender result undefined:', result);
+        return;
+      }
+
       const detectedGender = result.gender.toLowerCase();
+      const genderProb = result.genderProbability;
+
+      ctx.font = '20px system-ui, sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`Gender: ${detectedGender} (${Math.round(genderProb * 100)}%)`, 10, 40);
+      ctx.fillText(`Age: ~${Math.round(result.age)}`, 10, 70);
+
       const genderMatch =
         detectedGender === selectedGender ||
         (selectedGender === 'other' && detectedGender !== 'male' && detectedGender !== 'female');
 
-      ctx.font = '24px system-ui, sans-serif';
-      ctx.fillStyle = genderMatch ? '#4ade80' : '#f87171';
-      ctx.fillText(`${result.gender} (${Math.round(result.genderProbability * 100)}%)`, 10, 40);
-
       if (genderMatch) {
-        setStatus('verified');
+        setPhase('verified');
         setStatusText(`✓ Gender verified as ${detectedGender}! You are real.`);
         setTimeout(() => {
           if (streamRef.current) {
@@ -159,73 +233,7 @@ export default function FaceVerification({ selectedGender, onVerified }) {
         );
       }
     }
-  }, [selectedGender, onVerified, status]);
-
-  useEffect(() => {
-    let intervalId;
-    let mounted = true;
-
-    async function setup() {
-      setStatus('loading');
-      setStatusText('Loading face detection models...');
-
-      const modelsLoaded = await loadModels();
-      if (!mounted) return;
-
-      if (!modelsLoaded) {
-        setStatus('error');
-        setStatusText('Failed to load face detection models. Check your internet connection.');
-        return;
-      }
-
-      setStatusText('Starting camera...');
-      let stream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: 640, height: 480 },
-          audio: false,
-        });
-      } catch (err) {
-        if (!mounted) return;
-        setStatus('error');
-        if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-          setStatusText('Camera not found. Please connect a webcam and refresh.');
-        } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          setStatusText('Camera access denied. Please allow camera access in your browser settings and refresh.');
-        } else {
-          setStatusText(`Camera error: ${err.message}. Please refresh and try again.`);
-        }
-        return;
-      }
-
-      if (!mounted) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-
-      streamRef.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
-
-      setStatus('liveness');
-      setStatusText('Please blink naturally to prove you are a real person (2 blinks needed)...');
-
-      intervalId = setInterval(runDetection, 300);
-    }
-
-    setup();
-
-    return () => {
-      mounted = false;
-      if (intervalId) clearInterval(intervalId);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
-    };
-  }, [runDetection]);
+  }
 
   const statusLabel =
     status === 'loading' ? 'Loading...' :
@@ -240,7 +248,7 @@ export default function FaceVerification({ selectedGender, onVerified }) {
         <h2>Gender Verification</h2>
         {status === 'liveness' && (
           <p className="verified-hint">
-            Selected: <strong>{selectedGender}</strong>. You must blink to prove you are a real person.
+            Selected: <strong>{selectedGender}</strong>. Move your head slightly to prove you are real.
           </p>
         )}
         {status !== 'liveness' && (

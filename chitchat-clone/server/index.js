@@ -2,18 +2,32 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
 
+const isProd = process.env.NODE_ENV === 'production';
+const CLIENT_ORIGINS = isProd
+  ? [process.env.SITE_URL || 'https://your-app.onrender.com']
+  : ['http://localhost:5173', 'http://127.0.0.1:5173'];
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
+    origin: CLIENT_ORIGINS,
     methods: ['GET', 'POST'],
   },
 });
+
+if (isProd) {
+  app.use(express.static(path.join(__dirname, '../client/dist')));
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/socket.io')) return;
+    res.sendFile(path.join(__dirname, '../client/dist/index.html'));
+  });
+}
 
 const waitingUsers = [];
 const activeChats = new Map();

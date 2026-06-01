@@ -6,7 +6,9 @@ import FaceVerification from './components/FaceVerification';
 import ChatRoom from './components/ChatRoom';
 import './App.css';
 
-const SOCKET_URL = 'http://localhost:3001';
+const SOCKET_URL = window.location.origin === 'http://localhost:5173'
+  ? 'http://localhost:3001'
+  : window.location.origin;
 
 export default function App() {
   const [step, setStep] = useState('landing');
